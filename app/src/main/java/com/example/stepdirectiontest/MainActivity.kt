@@ -19,6 +19,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
@@ -35,6 +36,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val DIRECTION_HYSTERESIS_DEGREES = 15f
         // 數值越大，角度平滑反應越快；太大可能增加晃動造成的方向切換
         private const val DIRECTION_SMOOTHING_FACTOR = 0.35f
+        // 加速度補充偵測的門檻，單位約為 m/s^2；之後可依手機靈敏度調整
+        // 提高門檻，避免手持手機的小幅震動被當成一步
+        private const val ACCELERATION_THRESHOLD = 1.6f
+        // 放寬波峰下降判斷，避免正常走路的訊號一直沒有回到很低的值
+        private const val ACCELERATION_RELEASE_THRESHOLD = 0.9f
+        // 正常走路時，兩個步伐不應太靠近，避免一次晃動被算成多步
+        private const val MIN_ACCELERATION_STEP_INTERVAL_MS = 450L
+        // 等待短時間讓 Step Detector 與加速度候選可以合併去重
+        private const val STEP_FUSION_WINDOW_MS = 220L
+        // 手機正在快速旋轉時，不接受加速度補充候選
+        // 只排除較快速的原地轉手機，避免一般走路擺動被誤判成旋轉
+        private const val ROTATION_IGNORE_THRESHOLD = 1.2f
+        private const val ROTATION_IGNORE_WINDOW_MS = 150L
+        // 旋轉結束後短暫忽略殘留上下晃動，避免轉身被多算一步
+        private const val ROTATION_COOLDOWN_MS = 350L
+        private const val NANOS_PER_MILLISECOND = 1_000_000L
     }
 
     private lateinit var sensorManager: SensorManager
@@ -42,6 +59,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var stepDetectorSensor: Sensor? = null
     private var stepCounterSensor: Sensor? = null
     private var rotationVectorSensor: Sensor? = null
+    private var accelerometerSensor: Sensor? = null
+    private var gyroscopeSensor: Sensor? = null
 
     private lateinit var stepCountTextView: TextView
     private lateinit var directionTextView: TextView
@@ -64,6 +83,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var stepCounterRegistered = false
     private var stepCounterBaseline: Int? = null
     private var lastStepCounterTotal: Int? = null
+
+    // 混合步數偵測：加速度事件先放入候選清單，稍後和系統步數事件合併
+    private val pendingStepCandidates = mutableListOf<Long>()
+    private var lastAcceptedStepTimestampNs = Long.MIN_VALUE
+    private var lastAccelerationPeakTimestampNs = Long.MIN_VALUE
+    private var accelerationWasAboveThreshold = false
+    private var accelerationPeakTimestampNs = Long.MIN_VALUE
+    private var accelerationPeakValue = 0f
+    private val gravity = FloatArray(3)
+    private var hasGravityEstimate = false
+    private var latestAngularSpeed = 0f
+    private var latestGyroscopeTimestampNs = Long.MIN_VALUE
+    private var lastRotationDetectedTimestampNs = Long.MIN_VALUE
 
     // 第二階段：目前相對位置，起點固定為 (0, 0)
     private var currentX = 0
@@ -133,6 +165,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stepDetectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
         stepCounterSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        accelerometerSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        gyroscopeSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
         resetPosition()
         updateInitialSupportMessage()
@@ -160,21 +194,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_STEP_DETECTOR -> {
                 // Step Detector 每觸發一次通常代表偵測到一步
-                currentStepCount += (event.values.firstOrNull()?.roundToInt() ?: 1)
-                    .coerceAtLeast(1)
-                updateStepText()
+                if (isPhoneRotating(event.timestamp)) {
+                    Log.d(TAG, "Ignore Step Detector event while phone is rotating")
+                    return
+                }
                 statusTextView.text = "狀態：已收到 Step Detector 步數事件"
                 Log.d(TAG, "Step Detector event received")
-
-                // 只有開始記錄後，步數才會改變相對座標與路徑
-                if (isRecording) {
-                    updatePositionByDirection()
-                }
+                enqueueStepCandidate(event.timestamp)
             }
 
             Sensor.TYPE_STEP_COUNTER -> {
                 // Step Counter 是裝置開機後的累計值，因此要先記住本次測試的起始值
                 handleStepCounterEvent(event)
+            }
+
+            Sensor.TYPE_ACCELEROMETER -> {
+                // Step Detector 沒抓到時，使用加速度波峰產生補充候選
+                handleAccelerometerEvent(event)
+            }
+
+            Sensor.TYPE_GYROSCOPE -> {
+                handleGyroscopeEvent(event)
             }
 
             Sensor.TYPE_ROTATION_VECTOR -> {
@@ -300,6 +340,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     // Step Detector 已經註冊成功時，不再同時註冊 Step Counter。
                     // 避免兩個來源交錯更新同一個步數，造成重設後步數被忽略。
                     Log.d(TAG, "Using Step Detector as the only step sensor")
+
+                    // 加速度計只作為 Step Detector 漏步時的補充來源。
+                    if (accelerometerSensor != null) {
+                        val accelerationRegistered = sensorManager.registerListener(
+                            this,
+                            accelerometerSensor,
+                            SensorManager.SENSOR_DELAY_GAME
+                        )
+                        if (!accelerationRegistered) {
+                            statusMessages.add("加速度計註冊失敗")
+                        } else {
+                            Log.d(TAG, "Using accelerometer as a supplemental step source")
+                        }
+                    } else {
+                        statusMessages.add("此裝置不支援加速度計")
+                    }
+
+                    // 陀螺儀只用來排除轉手機造成的加速度假步數，不拿來當方向值。
+                    if (gyroscopeSensor != null) {
+                        sensorManager.registerListener(
+                            this,
+                            gyroscopeSensor,
+                            SensorManager.SENSOR_DELAY_GAME
+                        )
+                    }
                 } else {
                     statusMessages.add("Step Detector 註冊失敗")
                     registerStepCounterFallback(statusMessages) {
@@ -320,7 +385,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (usingStepCounter) {
             statusMessages.add("目前使用 Step Counter 備援")
         } else if (statusMessages.isEmpty()) {
-            statusMessages.add("Step Detector 已註冊，請在前景連續走幾步")
+            statusMessages.add("Step Detector + 加速度補充已註冊，請在前景連續走幾步")
         } else {
             statusMessages.add("請確認活動辨識權限，並在前景連續走幾步")
         }
@@ -382,6 +447,164 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * 用簡單的重力濾除與波峰判斷找出加速度步伐候選。
+     * 這裡不直接增加步數，必須先經過下面的候選合併與去重。
+     */
+    private fun handleAccelerometerEvent(event: SensorEvent) {
+        processPendingStepCandidates(event.timestamp)
+
+        if (!hasGravityEstimate) {
+            event.values.copyInto(gravity, endIndex = 3)
+            hasGravityEstimate = true
+            return
+        }
+
+        // 用低通方式估計重力，再從原始加速度扣除重力。
+        val gravityFactor = 0.8f
+        val movementFactor = 1f - gravityFactor
+        for (index in 0..2) {
+            gravity[index] = gravityFactor * gravity[index] +
+                movementFactor * event.values[index]
+        }
+
+        val linearX = event.values[0] - gravity[0]
+        val linearY = event.values[1] - gravity[1]
+        val linearZ = event.values[2] - gravity[2]
+        val movementAcceleration = sqrt(
+            linearX * linearX + linearY * linearY + linearZ * linearZ
+        )
+
+        // 手機正在旋轉時，清除這一波候選，避免原地轉向被算成一步。
+        if (isPhoneRotating(event.timestamp)) {
+            accelerationWasAboveThreshold = false
+            accelerationPeakTimestampNs = Long.MIN_VALUE
+            accelerationPeakValue = 0f
+            return
+        }
+
+        // 必須完整經過「上升到波峰，再下降」才建立候選，
+        // 不再於剛超過門檻的瞬間直接計算步數。
+        if (!accelerationWasAboveThreshold &&
+            movementAcceleration >= ACCELERATION_THRESHOLD
+        ) {
+            accelerationWasAboveThreshold = true
+            accelerationPeakTimestampNs = event.timestamp
+            accelerationPeakValue = movementAcceleration
+        } else if (accelerationWasAboveThreshold) {
+            if (movementAcceleration > accelerationPeakValue) {
+                accelerationPeakValue = movementAcceleration
+                accelerationPeakTimestampNs = event.timestamp
+            }
+
+            if (movementAcceleration <= ACCELERATION_RELEASE_THRESHOLD) {
+                accelerationWasAboveThreshold = false
+                val minimumIntervalNs =
+                    MIN_ACCELERATION_STEP_INTERVAL_MS * NANOS_PER_MILLISECOND
+                val hasEnoughTimeSinceLastPeak =
+                    lastAccelerationPeakTimestampNs == Long.MIN_VALUE ||
+                        accelerationPeakTimestampNs - lastAccelerationPeakTimestampNs >=
+                        minimumIntervalNs
+
+                if (accelerationPeakTimestampNs != Long.MIN_VALUE &&
+                    hasEnoughTimeSinceLastPeak
+                ) {
+                    lastAccelerationPeakTimestampNs = accelerationPeakTimestampNs
+                    enqueueStepCandidate(accelerationPeakTimestampNs)
+                }
+
+                accelerationPeakTimestampNs = Long.MIN_VALUE
+                accelerationPeakValue = 0f
+            }
+        }
+    }
+
+    /** 記錄目前旋轉速度；只作為加速度補充的排除條件。 */
+    private fun handleGyroscopeEvent(event: SensorEvent) {
+        latestAngularSpeed = sqrt(
+            event.values[0] * event.values[0] +
+                event.values[1] * event.values[1] +
+                event.values[2] * event.values[2]
+        )
+        latestGyroscopeTimestampNs = event.timestamp
+        if (latestAngularSpeed >= ROTATION_IGNORE_THRESHOLD) {
+            lastRotationDetectedTimestampNs = event.timestamp
+        }
+    }
+
+    private fun isPhoneRotating(timestampNs: Long): Boolean {
+        if (latestGyroscopeTimestampNs == Long.MIN_VALUE) return false
+        val timeSinceGyroscopeNs = abs(timestampNs - latestGyroscopeTimestampNs)
+        val ignoreWindowNs = ROTATION_IGNORE_WINDOW_MS * NANOS_PER_MILLISECOND
+        val cooldownNs = ROTATION_COOLDOWN_MS * NANOS_PER_MILLISECOND
+        val isRecentRotationSample = timeSinceGyroscopeNs <= ignoreWindowNs &&
+            latestAngularSpeed >= ROTATION_IGNORE_THRESHOLD
+        val isInRotationCooldown = lastRotationDetectedTimestampNs != Long.MIN_VALUE &&
+            timestampNs >= lastRotationDetectedTimestampNs &&
+            timestampNs - lastRotationDetectedTimestampNs <= cooldownNs
+        return isRecentRotationSample || isInRotationCooldown
+    }
+
+    /** 把系統步數與加速度候選放在同一個時間窗內去重。 */
+    private fun enqueueStepCandidate(timestampNs: Long) {
+        processPendingStepCandidates(timestampNs)
+
+        val fusionWindowNs = STEP_FUSION_WINDOW_MS * NANOS_PER_MILLISECOND
+        if (lastAcceptedStepTimestampNs != Long.MIN_VALUE &&
+            abs(timestampNs - lastAcceptedStepTimestampNs) <= fusionWindowNs
+        ) {
+            return
+        }
+
+        if (pendingStepCandidates.any {
+                abs(timestampNs - it) <= fusionWindowNs
+            }
+        ) {
+            return
+        }
+
+        pendingStepCandidates.add(timestampNs)
+        pendingStepCandidates.sort()
+    }
+
+    /** 候選事件經過短暫等待後，才正式算成一步。 */
+    private fun processPendingStepCandidates(nowTimestampNs: Long) {
+        val fusionWindowNs = STEP_FUSION_WINDOW_MS * NANOS_PER_MILLISECOND
+        val minimumStepIntervalNs =
+            MIN_ACCELERATION_STEP_INTERVAL_MS * NANOS_PER_MILLISECOND
+
+        while (pendingStepCandidates.isNotEmpty()) {
+            val candidateTimestampNs = pendingStepCandidates.first()
+            if (nowTimestampNs - candidateTimestampNs < fusionWindowNs) {
+                break
+            }
+
+            pendingStepCandidates.removeAll {
+                abs(it - candidateTimestampNs) <= fusionWindowNs
+            }
+
+            if (lastAcceptedStepTimestampNs == Long.MIN_VALUE ||
+                candidateTimestampNs - lastAcceptedStepTimestampNs >=
+                minimumStepIntervalNs
+            ) {
+                acceptStep(candidateTimestampNs)
+            }
+        }
+    }
+
+    /** 正式增加步數，並在記錄模式下同步加入座標與 Canvas 路徑。 */
+    private fun acceptStep(timestampNs: Long) {
+        lastAcceptedStepTimestampNs = timestampNs
+        currentStepCount++
+        updateStepText()
+        statusTextView.text = "狀態：已確認一步（系統或加速度感測器）"
+        Log.d(TAG, "Step accepted, steps=$currentStepCount")
+
+        if (isRecording) {
+            updatePositionByDirection()
+        }
+    }
+
     private fun updateStepText() {
         stepCountTextView.text = "步數：$currentStepCount"
     }
@@ -438,6 +661,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun resetPosition() {
         // 重設本次測試的步數、座標與路徑
         currentStepCount = 0
+        resetStepFusionState()
         currentX = 0
         currentY = 0
         stepCounterBaseline = null
@@ -461,6 +685,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         lastStepDirectionTextView.text = "最後一步方向：尚未記錄"
         updateMovementDirectionUi()
         updatePathView()
+    }
+
+    /** 重設混合步數偵測的暫存狀態，不影響方向校正。 */
+    private fun resetStepFusionState() {
+        pendingStepCandidates.clear()
+        lastAcceptedStepTimestampNs = Long.MIN_VALUE
+        lastAccelerationPeakTimestampNs = Long.MIN_VALUE
+        accelerationWasAboveThreshold = false
+        accelerationPeakTimestampNs = Long.MIN_VALUE
+        accelerationPeakValue = 0f
+        hasGravityEstimate = false
+        latestAngularSpeed = 0f
+        latestGyroscopeTimestampNs = Long.MIN_VALUE
+        lastRotationDetectedTimestampNs = Long.MIN_VALUE
     }
 
     private fun updatePositionUi() {
