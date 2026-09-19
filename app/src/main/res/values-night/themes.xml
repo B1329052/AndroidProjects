@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.StepDirectionTest" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#26A69A</item>
+        <item name="colorPrimaryVariant">#00796B</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+    </style>
+</resources>
