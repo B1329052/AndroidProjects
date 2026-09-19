@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.AlertDialog
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.PointF
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -16,22 +17,24 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // 用簡單的資料類別表示一個相對座標點
-    data class Point(val x: Float, val y: Float)
+    data class Point(val x: Int, val y: Int)
 
     companion object {
         private const val TAG = "StepDirectionTest"
         private const val REQUEST_ACTIVITY_RECOGNITION = 1001
-        // 連續五次判定相同方向後才切換，降低手機短暫晃動造成的誤判
-        private const val REQUIRED_STABLE_DIRECTION_READINGS = 5
-        private const val DIRECTION_HYSTERESIS_DEGREES = 8f
-        private const val DIAGONAL_STEP_SIZE = 0.7f
+        // 新方向要連續出現幾次，才允許 lockedDirection 切換
+        // 2 次可以縮短轉彎延遲，同時仍可避免單次感測雜訊立即切換
+        private const val DIRECTION_CONFIRM_COUNT = 2
+        // 四方位每個區間是 90 度；越過 45 度邊界約 15 度後才切換方向
+        private const val DIRECTION_HYSTERESIS_DEGREES = 15f
+        // 數值越大，角度平滑反應越快；太大可能增加晃動造成的方向切換
+        private const val DIRECTION_SMOOTHING_FACTOR = 0.35f
     }
 
     private lateinit var sensorManager: SensorManager
@@ -48,7 +51,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var currentYTextView: TextView
     private lateinit var pathCountTextView: TextView
     private lateinit var pathTextView: TextView
+    private lateinit var lastStepDirectionTextView: TextView
     private lateinit var movementDirectionTextView: TextView
+    private lateinit var recordingStatusTextView: TextView
+    private lateinit var pathView: PathView
 
     // 這裡用最單純的方式累加步數，方便第一階段驗證感測器是否有正常觸發
     private var currentStepCount = 0
@@ -60,21 +66,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var lastStepCounterTotal: Int? = null
 
     // 第二階段：目前相對位置，起點固定為 (0, 0)
-    private var currentX = 0f
-    private var currentY = 0f
+    private var currentX = 0
+    private var currentY = 0
 
-    // 保存目前方向，步數事件發生時使用最新方向更新座標
+    // 手機方向：用來顯示目前手機朝向，也作為校正的基準
     private var currentDirection = "北"
 
-    // 校正後的行走方向 = 穩定手機方向 + 八方向偏移量
+    // 鎖定方向：只有穩定確認後才更新，步數與路徑只使用這個方向
+    private var lockedDirection = "北"
+    private var lockedDirectionCandidate = "北"
+    private var lockedDirectionCandidateReadings = 0
+
+    // 校正後的行走方向 = 穩定手機方向 + 四方向偏移量
     private var walkingDirectionOffsetSteps = 0
     private var isWalkingDirectionCalibrated = false
-    private var movementDirection = "北"
     private var hasRealAzimuthReading = false
+    private var isRecording = false
 
-    private val directionNames = listOf(
-        "北", "東北", "東", "東南", "南", "西南", "西", "西北"
-    )
+    private val directionNames = listOf("北", "東", "南", "西")
 
     // 方向穩定化：避免手機短暫晃動就立刻改變座標方向
     private var smoothedAzimuthDegrees: Float? = null
@@ -99,7 +108,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         currentYTextView = findViewById(R.id.tvCurrentY)
         pathCountTextView = findViewById(R.id.tvPathCount)
         pathTextView = findViewById(R.id.tvPath)
+        lastStepDirectionTextView = findViewById(R.id.tvLastStepDirection)
         movementDirectionTextView = findViewById(R.id.tvMovementDirection)
+        recordingStatusTextView = findViewById(R.id.tvRecordingStatus)
+        pathView = findViewById(R.id.pathView)
 
         findViewById<Button>(R.id.btnResetPosition).setOnClickListener {
             resetPosition()
@@ -107,6 +119,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         findViewById<Button>(R.id.btnCalibrateWalkingDirection).setOnClickListener {
             showWalkingDirectionDialog()
+        }
+
+        findViewById<Button>(R.id.btnStartRecording).setOnClickListener {
+            startRecording()
+        }
+
+        findViewById<Button>(R.id.btnStopRecording).setOnClickListener {
+            stopRecording()
         }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -146,8 +166,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 statusTextView.text = "狀態：已收到 Step Detector 步數事件"
                 Log.d(TAG, "Step Detector event received")
 
-                // 使用這一步發生當下最近一次取得的方向更新相對座標
-                updatePositionByDirection()
+                // 只有開始記錄後，步數才會改變相對座標與路徑
+                if (isRecording) {
+                    updatePositionByDirection()
+                }
             }
 
             Sensor.TYPE_STEP_COUNTER -> {
@@ -253,7 +275,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val registered = sensorManager.registerListener(
                 this,
                 rotationVectorSensor,
-                SensorManager.SENSOR_DELAY_UI
+                SensorManager.SENSOR_DELAY_GAME
             )
             if (registered) {
                 registeredAnySensor = true
@@ -271,13 +293,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val registered = sensorManager.registerListener(
                     this,
                     stepDetectorSensor,
-                    SensorManager.SENSOR_DELAY_UI
+                    SensorManager.SENSOR_DELAY_GAME
                 )
                 if (registered) {
                     registeredAnySensor = true
-                    registerStepCounterBackup {
-                        registeredAnySensor = true
-                    }
+                    // Step Detector 已經註冊成功時，不再同時註冊 Step Counter。
+                    // 避免兩個來源交錯更新同一個步數，造成重設後步數被忽略。
+                    Log.d(TAG, "Using Step Detector as the only step sensor")
                 } else {
                     statusMessages.add("Step Detector 註冊失敗")
                     registerStepCounterFallback(statusMessages) {
@@ -320,7 +342,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val registered = sensorManager.registerListener(
             this,
             stepCounterSensor,
-            SensorManager.SENSOR_DELAY_UI
+            SensorManager.SENSOR_DELAY_GAME
         )
 
         if (registered) {
@@ -330,25 +352,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             onRegistered()
         } else {
             statusMessages.add("Step Counter 註冊失敗")
-        }
-    }
-
-    private fun registerStepCounterBackup(onRegistered: () -> Unit) {
-        if (stepCounterSensor == null || stepCounterRegistered) return
-
-        val registered = sensorManager.registerListener(
-            this,
-            stepCounterSensor,
-            SensorManager.SENSOR_DELAY_UI
-        )
-
-        if (registered) {
-            stepCounterRegistered = true
-            stepCounterBaseline = null
-            onRegistered()
-            Log.d(TAG, "Step Counter backup registered")
-        } else {
-            Log.w(TAG, "Step Counter backup registration failed")
         }
     }
 
@@ -384,6 +387,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun handleStepCounterEvent(event: SensorEvent) {
+        // 只有真的使用 Step Counter 備援時，才處理這類事件。
+        if (!usingStepCounter) return
+
         val totalSteps = event.values.firstOrNull()?.toInt() ?: return
         lastStepCounterTotal = totalSteps
 
@@ -398,9 +404,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (newSteps > 0) {
             currentStepCount = stepsSinceReset
 
-            // Step Counter 可能一次跳過多步，逐步補上每個路徑點
-            repeat(newSteps) {
-                updatePositionByDirection()
+            if (isRecording) {
+                // Step Counter 可能一次跳過多步，逐步補上每個路徑點
+                repeat(newSteps) {
+                    updatePositionByDirection()
+                }
             }
 
             updateStepText()
@@ -410,60 +418,82 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun updatePositionByDirection() {
-        // 每一步使用校正後的行走方向；尚未校正時會使用手機方向
-        when (movementDirection) {
-            "北" -> currentX += 1f
-            "東北" -> {
-                currentX += DIAGONAL_STEP_SIZE
-                currentY += DIAGONAL_STEP_SIZE
-            }
-            "東" -> currentY += 1f
-            "東南" -> {
-                currentX -= DIAGONAL_STEP_SIZE
-                currentY += DIAGONAL_STEP_SIZE
-            }
-            "南" -> currentX -= 1f
-            "西南" -> {
-                currentX -= DIAGONAL_STEP_SIZE
-                currentY -= DIAGONAL_STEP_SIZE
-            }
-            "西" -> currentY -= 1f
-            "西北" -> {
-                currentX += DIAGONAL_STEP_SIZE
-                currentY -= DIAGONAL_STEP_SIZE
-            }
+        // 每一步只使用已穩定鎖定的方向，避免瞬間角度晃動改變路徑
+        when (lockedDirection) {
+            "北" -> currentX += 1
+            "東" -> currentY += 1
+            "南" -> currentX -= 1
+            "西" -> currentY -= 1
         }
+
+        // 顯示這一步真正採用的方向，方便確認轉彎是否已被鎖定
+        lastStepDirectionTextView.text = "最後一步方向：$lockedDirection"
+        Log.d(TAG, "Path step direction=$lockedDirection, position=($currentX,$currentY)")
 
         pathPoints.add(Point(currentX, currentY))
         updatePositionUi()
+        updatePathView()
     }
 
     private fun resetPosition() {
         // 重設本次測試的步數、座標與路徑
         currentStepCount = 0
-        currentX = 0f
-        currentY = 0f
+        currentX = 0
+        currentY = 0
         stepCounterBaseline = null
         if (stepCounterRegistered) {
             stepCounterBaseline = lastStepCounterTotal
         }
 
         pathPoints.clear()
-        pathPoints.add(Point(0f, 0f))
+        pathPoints.add(Point(0, 0))
+
+        // 新測試不要沿用上一段路徑最後的方向，改用目前校正後的方向開始。
+        val detectedMovementDirection = detectCurrentMovementDirection()
+        if (detectedMovementDirection != null) {
+            lockedDirection = detectedMovementDirection
+            lockedDirectionCandidate = detectedMovementDirection
+            lockedDirectionCandidateReadings = 0
+        }
 
         updateStepText()
         updatePositionUi()
+        lastStepDirectionTextView.text = "最後一步方向：尚未記錄"
+        updateMovementDirectionUi()
+        updatePathView()
     }
 
     private fun updatePositionUi() {
-        currentXTextView.text = "目前 X：${formatCoordinate(currentX)}"
-        currentYTextView.text = "目前 Y：${formatCoordinate(currentY)}"
+        currentXTextView.text = "目前 X：$currentX"
+        currentYTextView.text = "目前 Y：$currentY"
         pathCountTextView.text = "已記錄路徑點數：${pathPoints.size}"
 
         val pathText = pathPoints.joinToString(" -> ") { point ->
-            "(${formatCoordinate(point.x)},${formatCoordinate(point.y)})"
+            "(${point.x},${point.y})"
         }
         pathTextView.text = "路徑：$pathText"
+    }
+
+    private fun updatePathView() {
+        val canvasPoints = pathPoints.map { point ->
+            PointF(point.x.toFloat(), point.y.toFloat())
+        }
+        pathView.setPath(canvasPoints)
+    }
+
+    private fun startRecording() {
+        // 開始新的路徑測試，起點重新設為 (0, 0)
+        resetPosition()
+        isRecording = true
+        recordingStatusTextView.text = "記錄狀態：記錄中"
+        statusTextView.text = "狀態：開始記錄，請開始走路"
+    }
+
+    private fun stopRecording() {
+        // 停止修改座標，但 sensor 仍然繼續顯示步數與方向
+        isRecording = false
+        recordingStatusTextView.text = "記錄狀態：已停止"
+        statusTextView.text = "狀態：已停止路徑記錄，感測器仍在監聽"
     }
 
     private fun showWalkingDirectionDialog() {
@@ -486,31 +516,80 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val currentIndex = directionNames.indexOf(currentDirection)
         if (targetIndex < 0 || currentIndex < 0) return
 
-        // 記錄實際行走方向與穩定手機方向之間相差幾個八方向
+        // 記錄實際行走方向與穩定手機方向之間相差幾個四方向
         walkingDirectionOffsetSteps =
             (targetIndex - currentIndex + directionNames.size) % directionNames.size
         isWalkingDirectionCalibrated = true
+        lockedDirection = targetDirection
+        lockedDirectionCandidate = targetDirection
+        lockedDirectionCandidateReadings = 0
         updateMovementDirectionUi()
 
         statusTextView.text = "狀態：行走方向已校正為$targetDirection"
     }
 
     private fun updateMovementDirectionUi() {
-        val phoneDirectionIndex = directionNames.indexOf(currentDirection)
-        val movementDirectionIndex =
-            (phoneDirectionIndex + walkingDirectionOffsetSteps) % directionNames.size
-        movementDirection = directionNames[movementDirectionIndex]
+        val phoneAzimuth = smoothedAzimuthDegrees ?: 0f
+        val movementAzimuth = normalizeAngle(
+            phoneAzimuth + walkingDirectionOffsetSteps * 90f
+        )
+        val movementDirectionIndex = directionIndexForPath(movementAzimuth)
+        val detectedMovementDirection = directionNames[movementDirectionIndex]
+
+        updateLockedDirection(detectedMovementDirection, movementAzimuth)
 
         movementDirectionTextView.text = if (isWalkingDirectionCalibrated) {
-            "行走方向：$movementDirection（已校正）"
+            "行走方向（鎖定）：$lockedDirection（已校正）"
         } else {
-            "行走方向：$movementDirection（同手機方向）"
+            "行走方向（鎖定）：$lockedDirection（同手機方向）"
         }
     }
 
-    private fun formatCoordinate(value: Float): String {
-        // 座標只顯示到小數第一位，避免路徑文字太長
-        return String.format(Locale.US, "%.1f", value)
+    // 取得目前「校正後」的行走方向，供重設測試時初始化 lockedDirection。
+    private fun detectCurrentMovementDirection(): String? {
+        val phoneAzimuth = smoothedAzimuthDegrees ?: return null
+        val movementAzimuth = normalizeAngle(
+            phoneAzimuth + walkingDirectionOffsetSteps * 90f
+        )
+        return directionNames[directionIndexForPath(movementAzimuth)]
+    }
+
+    private fun updateLockedDirection(
+        detectedDirection: String,
+        movementAzimuth: Float
+    ) {
+        if (detectedDirection == lockedDirection) {
+            lockedDirectionCandidateReadings = 0
+            lockedDirectionCandidate = lockedDirection
+            return
+        }
+
+        val candidateIndex = directionNames.indexOf(detectedDirection)
+        val candidateCenter = candidateIndex * 90f
+        val distanceFromCandidateCenter = abs(
+            shortestAngleDifference(movementAzimuth, candidateCenter)
+        )
+        val passedHysteresis = distanceFromCandidateCenter <=
+            (45f - DIRECTION_HYSTERESIS_DEGREES)
+
+        if (!passedHysteresis) {
+            // 還在邊界容錯區，維持原本 lockedDirection
+            lockedDirectionCandidateReadings = 0
+            return
+        }
+
+        if (detectedDirection == lockedDirectionCandidate) {
+            lockedDirectionCandidateReadings++
+        } else {
+            lockedDirectionCandidate = detectedDirection
+            lockedDirectionCandidateReadings = 1
+        }
+
+        // 新方向連續穩定出現後，才真正更新 lockedDirection
+        if (lockedDirectionCandidateReadings >= DIRECTION_CONFIRM_COUNT) {
+            lockedDirection = lockedDirectionCandidate
+            lockedDirectionCandidateReadings = 0
+        }
     }
 
     private fun updateDirectionUi(azimuthDegrees: Float) {
@@ -520,25 +599,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             azimuthDegrees
         } else {
             val difference = shortestAngleDifference(azimuthDegrees, previousAzimuth)
-            var next = previousAzimuth + difference * 0.2f
+            var next = previousAzimuth + difference * DIRECTION_SMOOTHING_FACTOR
             if (next < 0f) next += 360f
             if (next >= 360f) next -= 360f
             next
         }
         smoothedAzimuthDegrees = smoothed
 
-        val normalizedDegrees = smoothed.roundToInt().mod(360)
-        val directions = listOf("北", "東北", "東", "東南", "南", "西南", "西", "西北")
-        val directionIndex = ((normalizedDegrees + 22.5f) / 45f).toInt() % 8
+        val directions = directionNames
+        val directionIndex = directionIndexForPath(smoothed)
         val detectedDirection = directions[directionIndex]
 
         // 方向接近邊界時，必須再多轉一小段才允許切換
-        val candidateCenter = directionIndex * 45f
+        val candidateCenter = directionIndex * 90f
         val distanceFromCandidateCenter = abs(
             shortestAngleDifference(smoothed, candidateCenter)
         )
         val passedHysteresis = distanceFromCandidateCenter <=
-            (22.5f - DIRECTION_HYSTERESIS_DEGREES)
+            (45f - DIRECTION_HYSTERESIS_DEGREES)
 
         if (detectedDirection != currentDirection && !passedHysteresis) {
             // 還在容錯區內，維持上一個方向
@@ -551,13 +629,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         // 新方向連續穩定出現後才切換
-        if (candidateDirectionReadings >= REQUIRED_STABLE_DIRECTION_READINGS) {
+        if (candidateDirectionReadings >= DIRECTION_CONFIRM_COUNT) {
             currentDirection = candidateDirection
         }
 
         directionTextView.text = "目前方向：$currentDirection"
-        degreeTextView.text = "目前角度：${normalizedDegrees}°"
+        // 角度欄位保留原始感測角度，路徑則不直接使用這個瞬間值
+        val rawDegrees = normalizeAngle(azimuthDegrees).roundToInt().mod(360)
+        degreeTextView.text = "目前角度：${rawDegrees}°"
         updateMovementDirectionUi()
+    }
+
+    private fun normalizeAngle(angle: Float): Float {
+        return (angle % 360f + 360f) % 360f
+    }
+
+    private fun directionIndexForPath(azimuthDegrees: Float): Int {
+        // 四方向各約 90 度，搭配 hysteresis 降低邊界來回切換。
+        val degrees = (azimuthDegrees % 360f + 360f) % 360f
+        return when {
+            degrees >= 315f || degrees < 45f -> 0 // 北
+            degrees < 135f -> 1                    // 東
+            degrees < 225f -> 2                    // 南
+            else -> 3                              // 西
+        }
     }
 
     private fun shortestAngleDifference(from: Float, to: Float): Float {
